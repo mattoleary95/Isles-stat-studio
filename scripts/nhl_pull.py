@@ -9,9 +9,15 @@ from datetime import datetime, timezone
 TEAM = (sys.argv[1] if len(sys.argv) > 1 else "NYI").upper()
 UA = {"User-Agent": "Mozilla/5.0 (stat-studio)"}
 
-def get(url):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
-        return json.load(r)
+def get(url, tries=4):
+    import time
+    for i in range(tries):  # the NHL API occasionally times out; retry with a short pause
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
+                return json.load(r)
+        except Exception:
+            if i == tries - 1: raise
+            time.sleep(2 + 3 * i)
 
 def rest(kind, report, season):
     exp = urllib.parse.quote(f"seasonId={season} and gameTypeId=2")
@@ -81,7 +87,7 @@ def avg_row(rows, cols, rounding):
             if isinstance(v, (int, float)): vals.append(v)
         if not vals: out[c] = None; continue
         m = sum(vals) / len(vals)
-        if c == "TOI/GP": out[c] = toi(m)
+        if c in ("TOI/GP", "TOI"): out[c] = toi(m)
         elif "PCT" in c: out[c] = f"{m:.3f}".lstrip("0")
         else: out[c] = rounding.get(c, r1)(m)
     return out
@@ -240,10 +246,182 @@ if T:
     avg = avg_row(T, [c for c in TMC if c != "Team"], counts)
     T.append(avg)
 
+# ---------------- forward lines and D pairs (MoneyPuck, 5-on-5 together) ----------------
+mp_ln = mp_csv("lines") if season else []
+pid_name = {str(p.get("playerId")): p.get("skaterFullName", "") for p in sk_sum}
+LN_COLS = ["Name", "Team", "Type", "Ids", "Players", "GP", "TOI", "GF", "GA", "GF%", "xGF", "xGA", "xGF%", "CF%", "SF", "SA", "HDCF", "HDCA", "GF/60", "GA/60", "xGF/60", "xGA/60"]
+LN = []
+def per60(v, sec): return r2(div(v, (sec or 0) / 3600))
+for r in mp_ln:
+    if r.get("situation") != "5on5": continue
+    lid = r.get("lineId", ""); ids = [lid[i:i + 7] for i in range(0, len(lid), 7)] if lid and len(lid) % 7 == 0 else []
+    parts = (r.get("name") or "").split("-")
+    names = [pid_name.get(i) or (parts[k] if k < len(parts) and len(parts) == len(ids) else "") for k, i in enumerate(ids)]
+    if not ids or not all(names): continue
+    sec = f(r, "icetime"); gf, ga = f(r, "goalsFor"), f(r, "goalsAgainst"); xgf, xga = f(r, "xGoalsFor"), f(r, "xGoalsAgainst")
+    LN.append({"Name": " - ".join(n.split(" ")[-1] for n in names), "Team": MP_TEAM.get(r.get("team"), r.get("team")),
+               "Type": "F" if r.get("position") == "line" else "D", "Ids": "|".join(ids), "Players": "|".join(names),
+               "GP": f(r, "games_played"), "TOI": toi(sec), "_sec": sec, "GF": gf, "GA": ga,
+               "GF%": pct(div(gf, (gf or 0) + (ga or 0))) if (gf or 0) + (ga or 0) > 0 else None,
+               "xGF": r2(xgf), "xGA": r2(xga), "xGF%": pct(f(r, "xGoalsPercentage")), "CF%": pct(f(r, "corsiPercentage")),
+               "SF": f(r, "shotsOnGoalFor"), "SA": f(r, "shotsOnGoalAgainst"), "HDCF": f(r, "highDangerShotsFor"), "HDCA": f(r, "highDangerShotsAgainst"),
+               "GF/60": per60(gf, sec), "GA/60": per60(ga, sec), "xGF/60": per60(xgf, sec), "xGA/60": per60(xga, sec)})
+LN.sort(key=lambda r: (r["Team"] != TEAM, r["Team"], r["Type"], -(r["_sec"] or 0)))
+for typ in ("F", "D"):
+    rows = [r for r in LN if r["Type"] == typ]
+    if rows:
+        a = avg_row(rows, [c for c in LN_COLS if c not in ("Name", "Team", "Type", "Ids", "Players")], counts)
+        a.update({"Name": "League AVG", "Type": typ}); LN.append(a)
+
+
+# ---------------- Islanders game-by-game data (NHL.com shift charts, play-by-play, game logs) ----------------
+# For every completed regular-season game: who was on the ice for the Islanders at 5-on-5 (as
+# segments of time), the 5-on-5 shot attempts with the Islanders skaters on the ice for each, and
+# each Islanders skater's own numbers. The studio uses this for "last N games" line stats.
+def _sec(period, mmss):
+    try:
+        m, s2 = str(mmss).split(":"); return (int(period) - 1) * 1200 + int(m) * 60 + int(s2)
+    except Exception:
+        return None
+
+B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+def b36(n):
+    n = int(n); out = ""
+    while True:
+        out = B36[n % 36] + out; n //= 36
+        if not n: return out
+
+def game_data(gid, team_abbr):
+    pbp = get(f"https://api-web.nhle.com/v1/gamecenter/{gid}/play-by-play")
+    try: sh = get(f"https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={gid}").get("data", [])
+    except Exception: sh = []
+    home, away = pbp["homeTeam"], pbp["awayTeam"]
+    us_home = home.get("abbrev") == team_abbr
+    us_id, opp_id = (home if us_home else away)["id"], (away if us_home else home)["id"]
+    opp = (away if us_home else home).get("abbrev", "")
+    ros = {r["playerId"]: (r["teamId"], r.get("positionCode", "")) for r in pbp.get("rosterSpots", [])}
+    goalie = {pid for pid, (t, p) in ros.items() if p == "G"}
+    shifts = []
+    for x in sh:
+        if x.get("typeCode") != 517 or not x.get("startTime") or not x.get("endTime"): continue
+        a, b = _sec(x["period"], x["startTime"]), _sec(x["period"], x["endTime"])
+        if a is None or b is None or b <= a: continue
+        shifts.append((x["playerId"], x["teamId"], a, b))
+    # extras the game logs don't have: hits, blocks, takeaways, giveaways
+    extra = {}
+    def X(pid): return extra.setdefault(pid, {"hit": 0, "blk": 0, "tk": 0, "gv": 0})
+    def ours_p(pid): return pid is not None and ros.get(pid, (None,))[0] == us_id and pid not in goalie
+    for e in pbp.get("plays", []):
+        typ = e.get("typeDescKey"); d = e.get("details", {}) or {}
+        if typ == "hit" and ours_p(d.get("hittingPlayerId")): X(d["hittingPlayerId"])["hit"] += 1
+        elif typ == "blocked-shot" and ours_p(d.get("blockingPlayerId")): X(d["blockingPlayerId"])["blk"] += 1
+        elif typ == "takeaway" and ours_p(d.get("playerId")): X(d["playerId"])["tk"] += 1
+        elif typ == "giveaway" and ours_p(d.get("playerId")): X(d["playerId"])["gv"] += 1
+    out = {"id": gid, "date": pbp.get("gameDate", ""), "opp": opp, "home": us_home, "shifts": bool(shifts),
+           "p": "", "sets": "", "seg": "", "ev": "", "extra": extra}
+    if not shifts: return out
+    end = max(b for _, _, _, b in shifts)
+    sk = {us_id: [0] * end, opp_id: [0] * end}; gl = {us_id: [0] * end, opp_id: [0] * end}
+    ours = [[] for _ in range(end)]
+    for pid, tid, a, b in shifts:
+        if tid not in sk: continue
+        isg = pid in goalie
+        for s2 in range(a, b):
+            if isg: gl[tid][s2] = 1
+            else:
+                sk[tid][s2] += 1
+                if tid == us_id: ours[s2].append(pid)
+    players, pindex, sets, setindex = [], {}, [], {}
+    def pi(pid):
+        if pid not in pindex: pindex[pid] = len(players); players.append(pid)
+        return pindex[pid]
+    def si(group):
+        key = tuple(sorted(pi(p) for p in group))
+        if key not in setindex: setindex[key] = len(sets); sets.append(key)
+        return setindex[key]
+    segs, cur, start = [], None, 0
+    for s2 in range(end + 1):
+        five = s2 < end and sk[us_id][s2] == 5 and sk[opp_id][s2] == 5 and gl[us_id][s2] and gl[opp_id][s2]
+        key = si(ours[s2]) if five else None
+        if key != cur:
+            if cur is not None: segs.append((start, s2 - start, cur))
+            cur, start = key, s2
+    # on the ice for an event if the shift started before it and ends at or after it
+    def on_ice_at(t): return [pid for pid, tid, a, b in shifts if tid == us_id and pid not in goalie and a < t <= b]
+    evs = []
+    for e in pbp.get("plays", []):
+        pd = e.get("periodDescriptor", {}) or {}
+        if pd.get("periodType") == "SO": continue
+        typ = e.get("typeDescKey"); d = e.get("details", {}) or {}
+        if typ not in ("goal", "shot-on-goal", "missed-shot", "blocked-shot") or str(e.get("situationCode", "")) != "1551": continue
+        t = _sec(pd.get("number", 1), e.get("timeInPeriod", "00:00"))
+        shooter = d.get("scoringPlayerId") or d.get("shootingPlayerId")
+        st = ros.get(shooter, (d.get("eventOwnerTeamId") if typ != "blocked-shot" else None,))[0]
+        if t is None or st is None: continue
+        code = {"goal": "g", "shot-on-goal": "s", "missed-shot": "m", "blocked-shot": "b"}[typ]
+        evs.append((t, code.upper() if st == us_id else code, si(on_ice_at(t))))
+    out.update({"p": ",".join(str(x) for x in players),
+                "sets": ";".join("".join(B36[i] for i in k) for k in sets),
+                "seg": ";".join(f"{b36(a)}.{b36(l)}.{b36(k)}" for a, l, k in segs),
+                "ev": ";".join(f"{b36(t)}.{c}.{b36(k)}" for t, c, k in evs)})
+    return out
+
+GAMES = []
+try:
+    sched = get(f"https://api-web.nhle.com/v1/club-schedule-season/{TEAM}/{season}").get("games", []) if season else []
+    done = [x for x in sched if x.get("gameType") == 2 and x.get("gameState") in ("OFF", "FINAL")]
+    for x in done:
+        try: GAMES.append(game_data(x["id"], TEAM))
+        except Exception as e: print(f"warning: game {x.get('id')} skipped: {e}", file=sys.stderr)
+except Exception as e:
+    print(f"warning: schedule unavailable: {e}", file=sys.stderr)
+GAMES.sort(key=lambda g: g["date"])
+# each Islanders skater's game log (goals, assists, +/-, PP points, shots, PIM, TOI per game)
+GLOG = {}
+for s_ in club.get("skaters", []):
+    pid = s_.get("playerId")
+    try: lg_ = get(f"https://api-web.nhle.com/v1/player/{pid}/game-log/{season}/2").get("gameLog", [])
+    except Exception as e:
+        print(f"warning: game log {pid} unavailable: {e}", file=sys.stderr); continue
+    for r in lg_: GLOG.setdefault(r.get("gameId"), {})[pid] = r
+for g_ in GAMES:
+    rows = []
+    pids = set(GLOG.get(g_["id"], {})) | set(g_["extra"])
+    for pid in pids:
+        r = GLOG.get(g_["id"], {}).get(pid, {}); x = g_["extra"].get(pid, {})
+        tsec = 0
+        try: m_, s_2 = str(r.get("toi", "0:00")).split(":"); tsec = int(m_) * 60 + int(s_2)
+        except Exception: pass
+        vals = [r.get("goals", 0), r.get("assists", 0), r.get("powerPlayPoints", 0), r.get("shots", 0), (r.get("plusMinus", 0) or 0) + 100,
+                r.get("pim", 0), x.get("hit", 0), x.get("blk", 0), x.get("tk", 0), x.get("gv", 0), tsec, 1 if r else 0]
+        rows.append(f"{pid}." + ".".join(b36(v or 0) for v in vals))
+    g_["ind"] = ";".join(rows); del g_["extra"]
+
 out = {"updated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "season": season, "team": TEAM,
        "source": "NHL.com stats API" + (" + MoneyPuck.com" if MP else ""), "F": to_csv(SK, F), "D": to_csv(SK, D), "G": to_csv(GO, G),
        "players": sum(1 for r in F + D + G if r["Name"] != "League AVG"),
        "LF": to_csv(LSK, LF), "LD": to_csv(LSK, LD), "LG": to_csv(LGO, LG), "league_players": len(LF) + len(LD) + len(LG),
        "T": to_csv(TMC, T), "teams": sum(1 for r in T if r["Name"] != "League AVG"), "moneypuck": MP,
-       "mp_cols": (MP_SK_COLS + MP_GO_COLS + TM_MP) if MP else []}
+       "mp_cols": (MP_SK_COLS + MP_GO_COLS + TM_MP) if MP else [],
+       "LN": to_csv(LN_COLS, LN), "lines": sum(1 for r in LN if r["Name"] != "League AVG"),
+       "games": GAMES, "games_with_shifts": sum(1 for g in GAMES if g.get("shifts")),
+       "nyi_ids": {str(p.get("playerId")): nm(p) for p in club.get("skaters", [])}}
+
+# --split DIR: also write the pieces as separate documents for the Claude studio's database
+# (each document must stay under 256 KB): nyi (main), league (every NHL player), lines, games_0, games_1, ...
+if "--split" in sys.argv:
+    import os
+    d_ = sys.argv[sys.argv.index("--split") + 1]; os.makedirs(d_, exist_ok=True)
+    league = {k: out[k] for k in ("LF", "LD", "LG")}
+    lines_doc = {"LN": out["LN"]}
+    chunks = [GAMES[i:i + 20] for i in range(0, len(GAMES), 20)] or [[]]
+    main = {k: v for k, v in out.items() if k not in ("LF", "LD", "LG", "LN", "games")}
+    main["parts"] = ["league", "lines"] + [f"games_{i}" for i in range(len(chunks))]
+    docs = {"nyi": main, "league": league, "lines": lines_doc}
+    for i, c in enumerate(chunks): docs[f"games_{i}"] = {"games": c}
+    for k, v in docs.items():
+        txt = json.dumps(v)
+        if len(txt.encode()) > 250000: sys.exit(f"document {k} is too big ({len(txt)} bytes)")
+        with open(os.path.join(d_, k + ".json"), "w") as fh: fh.write(txt)
+    with open(os.path.join(d_, "_manifest.json"), "w") as fh: json.dump(sorted(docs), fh)
 print(json.dumps(out))
